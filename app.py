@@ -1,13 +1,12 @@
 # app.py
 import os
-import math
 import joblib
 import numpy as np
 import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
 from dataclasses import dataclass
-from typing import List, Tuple, Optional, Dict
+from typing import List, Tuple, Optional, Dict, Set
 
 # ------------------------------
 # Streamlit Page Config
@@ -19,7 +18,7 @@ st.set_page_config(
 )
 
 # ------------------------------
-# Loading Data & Model
+# Load Data & Model
 # ------------------------------
 @st.cache_data
 def load_csv_same_dir(filename: str) -> pd.DataFrame:
@@ -40,18 +39,18 @@ def load_model_same_dir(filename: str):
             return None
     return None
 
-data = load_csv_same_dir("Data.csv")
+df_raw = load_csv_same_dir("Data.csv")
 attrition_model = load_model_same_dir("attrition_model.pkl")
 
 # ------------------------------
-# Lightweight schema inference & feature prep
+# Schema inference & features
 # ------------------------------
 def normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     out.columns = [c.strip().lower().replace(" ", "_") for c in out.columns]
     return out
 
-df = normalize_cols(data)
+df = normalize_cols(df_raw)
 
 def first_existing(df, cols, default=None):
     for c in cols:
@@ -66,12 +65,8 @@ if COL_ID not in df.columns:
 COL_ROLE    = first_existing(df, ["job_role","role","level","joblevel","job_level"], None)
 if COL_ROLE is None:
     COL_ROLE = "role"
-    # Synthesize if missing
     rng = np.random.default_rng(42)
-    if len(df) > 0:
-        df[COL_ROLE] = rng.choice(["IC","Manager","Senior"], p=[0.55,0.30,0.15], size=len(df))
-    else:
-        df[COL_ROLE] = []
+    df[COL_ROLE] = rng.choice(["IC","Manager","Senior"], p=[0.55,0.30,0.15], size=len(df))
 
 COL_GENDER  = first_existing(df, ["gender","sex"], None)
 if COL_GENDER is None:
@@ -122,7 +117,6 @@ if COL_ATTRITION and df[COL_ATTRITION].dtype.kind not in "iu":
         tmp = tmp.fillna(0)
     df[COL_ATTRITION] = tmp.astype(int)
 
-# Map role to 3-level pipeline
 ROLE_MAP = {
     "ic": "IC",
     "individual_contributor": "IC",
@@ -140,10 +134,8 @@ ROLE_MAP = {
 }
 df["role_level"] = df[COL_ROLE].astype(str).str.lower().map(lambda x: ROLE_MAP.get(x, "IC"))
 
-# ------------------------------
-# Skills & readiness
-# ------------------------------
-def parse_skills(s):
+# Skills & readiness helpers
+def parse_skills(s) -> Set[str]:
     if pd.isna(s): return set()
     return set([t.strip().lower() for t in str(s).split(",") if t.strip()])
 
@@ -158,7 +150,6 @@ skills_parsed = df[COL_SKILLS].apply(parse_skills)
 df["skill_score_mid"] = skills_parsed.apply(lambda s: jaccard(s, set(TARGET_MID_SKILLS)))
 df["skill_score_senior"] = skills_parsed.apply(lambda s: jaccard(s, set(TARGET_SENIOR_SKILLS)))
 
-# Normalize perf/tenure for readiness
 def minmax(x):
     return (x - x.min())/(x.max()-x.min()+1e-9) if len(x)>0 else x*0
 
@@ -170,16 +161,11 @@ READY_MID_TH    = 0.55
 READY_SENIOR_TH = 0.60
 
 # ------------------------------
-# Attrition probability helper
+# Attrition prob (model or heuristic)
 # ------------------------------
 def infer_attrition_prob(sub: pd.DataFrame) -> np.ndarray:
-    """
-    Use the provided model if available and compatible; else heuristic.
-    The model is expected to support predict_proba and accept a reasonable subset of features.
-    """
-    # Try model
+    # try the provided model with several feature sets
     if attrition_model is not None:
-        # try a few common feature sets
         candidate_feature_sets = [
             [COL_AGE, COL_TENURE, COL_PERF, COL_GENDER, COL_RACE, "role_level"],
             [COL_AGE, COL_TENURE, COL_PERF, "role_level"],
@@ -188,24 +174,22 @@ def infer_attrition_prob(sub: pd.DataFrame) -> np.ndarray:
         for feats in candidate_feature_sets:
             try:
                 X = sub[feats].copy()
-                # one-hot simple encoding for categoricals if estimator can't handle strings
+                # one-hot minimal handling if model can't take strings
                 for c in X.columns:
                     if X[c].dtype == 'O':
                         X = pd.get_dummies(X, columns=[c], drop_first=True)
-                # Add missing columns as zeros if model was trained with more columns (joblib pipeline usually handles)
                 p = attrition_model.predict_proba(X)[:,1]
                 return np.clip(p, 0.02, 0.60)
             except Exception:
                 continue
-        # If predict_proba not available
         try:
-            p = attrition_model.predict(sub[[COL_TENURE]].fillna(0))  # last-ditch
+            p = attrition_model.predict(sub[[COL_TENURE]].fillna(0))
             p = np.where(p>0.5, 0.35, 0.08)
             return np.clip(p, 0.02, 0.60)
         except Exception:
             pass
 
-    # Heuristic fallback
+    # heuristic fallback
     base = np.where(sub["role_level"].eq("IC"), 0.16,
             np.where(sub["role_level"].eq("Mid"), 0.10, 0.07))
     adj_tenure = np.where(sub[COL_TENURE] < 1.0, +0.06, np.where(sub[COL_TENURE] < 3.0, +0.03, -0.01))
@@ -259,7 +243,6 @@ def apply_upskill(d: pd.DataFrame, lift: float):
     d = d.copy()
     d["skill_score_mid"]    = np.clip(d["skill_score_mid"] + lift, 0, 1)
     d["skill_score_senior"] = np.clip(d["skill_score_senior"] + lift, 0, 1)
-    # recompute readiness with updated skills (perf/tenure already normed globally)
     perf_norm   = minmax(d[COL_PERF])
     tenure_norm = minmax(d[COL_TENURE])
     d["readiness_mid"]    = 0.5*perf_norm + 0.2*tenure_norm + 0.3*d["skill_score_mid"]
@@ -271,7 +254,6 @@ def run_sim(initial: pd.DataFrame, config: TwinConfig) -> Tuple[pd.DataFrame, Li
     results: List[ScenarioResult] = []
     base_mid_req    = (pop["role_level"]=="Mid").sum()
     base_senior_req = (pop["role_level"]=="Senior").sum()
-
     rng = np.random.default_rng(123)
 
     for year in range(1, config.years+1):
@@ -398,7 +380,6 @@ def run_sim(initial: pd.DataFrame, config: TwinConfig) -> Tuple[pd.DataFrame, Li
 def results_to_frame(results: List[ScenarioResult]) -> pd.DataFrame:
     return pd.DataFrame([r.__dict__ for r in results])
 
-# Static comparator
 def static_successor_forecast(d: pd.DataFrame, years:int=5) -> pd.DataFrame:
     snap = d.copy()
     ready_mid = (snap["role_level"].eq("IC") & (snap["readiness_mid"] >= READY_MID_TH)).sum()
@@ -417,7 +398,7 @@ def static_successor_forecast(d: pd.DataFrame, years:int=5) -> pd.DataFrame:
     return pd.DataFrame(out)
 
 # ------------------------------
-# Sidebar Controls (What-if)
+# Sidebar controls for Simulation
 # ------------------------------
 st.sidebar.title("⚙️ What-If Controls")
 years               = st.sidebar.slider("Years to simulate", 3, 10, 5)
@@ -431,7 +412,6 @@ upskill_program     = st.sidebar.slider("Upskill Lift to Skills", 0.0, 0.30, 0.1
 mid_growth          = st.sidebar.slider("Mid Demand Growth (%)", 0, 10, 2)/100.0
 senior_growth       = st.sidebar.slider("Senior Demand Growth (%)", 0, 10, 2)/100.0
 
-# compute base hiring counts from initial df
 base_ic  = (df["role_level"]=="IC").sum()
 base_mid = (df["role_level"]=="Mid").sum()
 
@@ -449,45 +429,10 @@ config = TwinConfig(
 )
 
 # ------------------------------
-# TOP: Overview (Data + Model)
+# Precompute scenarios
 # ------------------------------
-st.title("📊 Leadership Pipeline Digital Twin")
-st.caption("Predict leadership gaps, skills, DEI, and retention — and compare static succession vs. digital-twin simulation.")
-c1, c2, c3 = st.columns(3)
-with c1:
-    st.metric("Employees", len(df))
-with c2:
-    st.metric("Mid Leaders", int((df["role_level"]=="Mid").sum()))
-with c3:
-    st.metric("Senior Leaders", int((df["role_level"]=="Senior").sum()))
-
-st.subheader("Data Overview")
-with st.expander("Preview & Summary", expanded=False):
-    st.dataframe(df.head(), use_container_width=True)
-    st.write(df.describe(include='all'))
-
-# Basic visuals
-st.subheader("Data Visualizations")
-vc1, vc2 = st.columns(2)
-with vc1:
-    fig, ax = plt.subplots()
-    df["role_level"].value_counts().reindex(["IC","Mid","Senior"]).plot(kind="bar", ax=ax)
-    ax.set_title("Role Level Distribution")
-    ax.set_ylabel("Count")
-    st.pyplot(fig)
-with vc2:
-    fig, ax = plt.subplots()
-    df[COL_PERF].plot(kind="hist", bins=10, ax=ax)
-    ax.set_title("Performance Rating Distribution")
-    ax.set_xlabel("Performance")
-    st.pyplot(fig)
-
-# ------------------------------
-# SIMULATIONS
-# ------------------------------
-# Baseline (Business-as-Usual)
 np.random.seed(42)
-pop_A, res_A = run_sim(df, TwinConfig(
+pop_baseline, res_baseline = run_sim(df, TwinConfig(
     years=years,
     annual_hiring_ic=int(round(base_ic*0.10)),
     annual_hiring_mid=int(round(base_mid*0.02)),
@@ -495,172 +440,246 @@ pop_A, res_A = run_sim(df, TwinConfig(
     mid_demand_growth=0.02,
     senior_demand_growth=0.02
 ))
-tbl_A = results_to_frame(res_A)
+tbl_baseline = results_to_frame(res_baseline)
 
-# Custom Scenario from sidebar
-pop_S, res_S = run_sim(df, config)
-tbl_S = results_to_frame(res_S)
+pop_scn, res_scn = run_sim(df, config)
+tbl_scn = results_to_frame(res_scn)
 
-# Static comparator
 static_tbl = static_successor_forecast(df, years=years)
 
 # ------------------------------
-# MID-LEVEL GAPS (Feature 4)
+# TABS
 # ------------------------------
-st.header("🔭 Predicting Mid-Level Leadership Gaps")
-c = st.columns(2)
-with c[0]:
-    st.write("**Business-as-Usual (Baseline)**")
+tabs = st.tabs([
+    "📊 Data Overview",
+    "🤖 Attrition Prediction",
+    "🔭 Leadership Gap Forecast",
+    "🧠 Skill Shortage Analysis",
+    "🧪 What-If & Digital Twin",
+    "🚨 Retention Risk Forecast",
+    "🌍 Diversity & DEI",
+    "⚖️ Static vs Digital Twin",
+    "🎯 Research Conclusion",
+])
+
+# ===== Tab 1: Data Overview =====
+with tabs[0]:
+    st.subheader("Dataset Preview & Summary")
+    st.dataframe(df.head(), use_container_width=True)
+    st.write(df.describe(include='all'))
+
+    st.subheader("Role Level Distribution")
     fig, ax = plt.subplots()
-    ax.plot(tbl_A["year"], tbl_A["mid_gap"], marker="o")
-    ax.set_title("Mid-Level Gap (Baseline)")
-    ax.set_xlabel("Year")
-    ax.set_ylabel("Gap = Required − Headcount")
-    ax.grid(True)
-    st.pyplot(fig)
-with c[1]:
-    st.write("**Your Scenario (Sidebar Controls)**")
-    fig, ax = plt.subplots()
-    ax.plot(tbl_S["year"], tbl_S["mid_gap"], marker="o")
-    ax.set_title("Mid-Level Gap (Your Scenario)")
-    ax.set_xlabel("Year")
-    ax.set_ylabel("Gap = Required − Headcount")
-    ax.grid(True)
+    df["role_level"].value_counts().reindex(["IC","Mid","Senior"]).plot(kind="bar", ax=ax)
+    ax.set_ylabel("Count")
     st.pyplot(fig)
 
-# ------------------------------
-# SKILL SHORTAGES (Features 5 & 6)
-# ------------------------------
-st.header("🧠 Skill Shortages")
-c = st.columns(2)
-with c[0]:
-    st.write("**Mid-Level Skill Coverage (Baseline)**")
+    st.subheader("Performance Rating Distribution")
     fig, ax = plt.subplots()
-    ax.plot(tbl_A["year"], tbl_A["mid_skill_coverage"], marker="o")
-    ax.set_title("Mid Skill Coverage — Baseline")
-    ax.set_xlabel("Year"); ax.set_ylabel("Share >= threshold")
-    ax.set_ylim(0,1); ax.grid(True)
-    st.pyplot(fig)
-with c[1]:
-    st.write("**Mid-Level Skill Coverage (Your Scenario)**")
-    fig, ax = plt.subplots()
-    ax.plot(tbl_S["year"], tbl_S["mid_skill_coverage"], marker="o")
-    ax.set_title("Mid Skill Coverage — Scenario")
-    ax.set_xlabel("Year"); ax.set_ylabel("Share >= threshold")
-    ax.set_ylim(0,1); ax.grid(True)
+    df[COL_PERF].plot(kind="hist", bins=12, ax=ax)
+    ax.set_xlabel("Performance"); ax.set_ylabel("Count")
     st.pyplot(fig)
 
-st.caption("Low coverage + positive gaps ⇒ **skill-driven** leadership shortages.")
+# ===== Tab 2: Attrition Prediction (with input form) =====
+with tabs[1]:
+    st.subheader("Predict Attrition Risk + Promotion Readiness")
 
-# ------------------------------
-# WHAT-IF & DIVERSITY (Features 7 & 8)
-# ------------------------------
-st.header("🧪 What-If Scenarios & Diversity")
-c = st.columns(2)
-with c[0]:
-    st.write("**Diversity in Mid-Level Leadership**")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        in_age = st.number_input("Age", min_value=18, max_value=75, value=30, step=1)
+        in_tenure = st.number_input("Years at Company", min_value=0.0, max_value=40.0, value=2.0, step=0.1)
+        in_perf = st.slider("Performance Rating (1-4)", 1, 4, 3)
+    with col2:
+        in_role = st.selectbox("Role Level", ["IC","Mid","Senior"])
+        in_gender = st.selectbox("Gender", ["Male","Female","Nonbinary"])
+        in_race = st.selectbox("Race/Ethnicity", ["White","Asian","Black","Hispanic","Other"])
+    with col3:
+        in_skills = st.text_input("Skills (comma-separated)", "people_mgmt, project_mgmt, product")
+
+    if st.button("Predict"):
+        # Build a one-row DF with the same schema
+        pred_df = pd.DataFrame([{
+            COL_ID: 999999,
+            COL_AGE: in_age,
+            COL_TENURE: in_tenure,
+            COL_PERF: in_perf,
+            COL_GENDER: in_gender,
+            COL_RACE: in_race,
+            COL_SKILLS: in_skills,
+            "role_level": in_role
+        }])
+
+        # compute skill & readiness for the candidate
+        sset = parse_skills(in_skills)
+        pred_df["skill_score_mid"] = jaccard(sset, TARGET_MID_SKILLS)
+        pred_df["skill_score_senior"] = jaccard(sset, TARGET_SENIOR_SKILLS)
+        # normalize perf/tenure relative to population (robust)
+        def rminmax(val, series):
+            mn, mx = series.min(), series.max()
+            return (val - mn) / (mx - mn + 1e-9)
+        pnorm = rminmax(in_perf, df[COL_PERF])
+        tnorm = rminmax(in_tenure, df[COL_TENURE])
+        pred_df["readiness_mid"] = 0.5*pnorm + 0.2*tnorm + 0.3*pred_df["skill_score_mid"]
+        pred_df["readiness_senior"] = 0.4*pnorm + 0.2*tnorm + 0.4*pred_df["skill_score_senior"]
+
+        # Attrition prob from model/heuristic
+        try:
+            ap = float(infer_attrition_prob(pred_df)[0])
+        except Exception as e:
+            ap = np.nan
+            st.warning(f"Prediction failed; details: {e}")
+
+        st.markdown("#### Results")
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.metric("Predicted Attrition Risk", f"{ap*100:.1f}%" if not np.isnan(ap) else "N/A")
+        with c2:
+            st.metric("Readiness (IC→Mid)", f"{float(pred_df['readiness_mid'])*100:.1f}%")
+            st.caption(f"Ready-now threshold: {READY_MID_TH*100:.0f}%")
+        with c3:
+            st.metric("Readiness (Mid→Senior)", f"{float(pred_df['readiness_senior'])*100:.1f}%")
+            st.caption(f"Ready-now threshold: {READY_SENIOR_TH*100:.0f}%")
+
+        # Simple rule-based recommendation
+        recs = []
+        if in_role == "IC" and float(pred_df["readiness_mid"]) >= READY_MID_TH:
+            recs.append("✅ Promote to Mid: readiness meets threshold.")
+        elif in_role == "IC":
+            recs.append("📈 Upskill for Mid: strengthen people_mgmt / project_mgmt / product.")
+        if in_role == "Mid" and float(pred_df["readiness_senior"]) >= READY_SENIOR_TH:
+            recs.append("✅ Consider promotion to Senior: readiness meets threshold.")
+        elif in_role == "Mid":
+            recs.append("📈 Upskill for Senior: focus on product / strategy / AI governance.")
+        if not np.isnan(ap):
+            if ap >= 0.25:
+                recs.append("⚠️ Retention Risk: consider tailored retention plan.")
+            else:
+                recs.append("🙂 Retention risk looks manageable.")
+        st.write("\n".join(recs))
+
+# ===== Tab 3: Leadership Gap Forecast =====
+with tabs[2]:
+    st.subheader("Mid-Level Leadership Gap Over Time")
+    c = st.columns(2)
+    with c[0]:
+        st.write("**Baseline**")
+        fig, ax = plt.subplots()
+        ax.plot(tbl_baseline["year"], tbl_baseline["mid_gap"], marker="o")
+        ax.set_xlabel("Year"); ax.set_ylabel("Gap (Required − Headcount)"); ax.grid(True)
+        st.pyplot(fig)
+    with c[1]:
+        st.write("**Your Scenario**")
+        fig, ax = plt.subplots()
+        ax.plot(tbl_scn["year"], tbl_scn["mid_gap"], marker="o")
+        ax.set_xlabel("Year"); ax.set_ylabel("Gap (Required − Headcount)"); ax.grid(True)
+        st.pyplot(fig)
+
+# ===== Tab 4: Skill Shortage Analysis =====
+with tabs[3]:
+    st.subheader("Mid & Senior Skill Coverage")
+    c = st.columns(2)
+    with c[0]:
+        st.write("**Mid Skill Coverage**")
+        fig, ax = plt.subplots()
+        ax.plot(tbl_baseline["year"], tbl_baseline["mid_skill_coverage"], marker="o", label="Baseline")
+        ax.plot(tbl_scn["year"], tbl_scn["mid_skill_coverage"], marker="o", label="Scenario")
+        ax.set_ylim(0,1); ax.set_xlabel("Year"); ax.set_ylabel("Share ≥ threshold"); ax.grid(True); ax.legend()
+        st.pyplot(fig)
+    with c[1]:
+        st.write("**Senior Skill Coverage**")
+        fig, ax = plt.subplots()
+        ax.plot(tbl_baseline["year"], tbl_baseline["senior_skill_coverage"], marker="o", label="Baseline")
+        ax.plot(tbl_scn["year"], tbl_scn["senior_skill_coverage"], marker="o", label="Scenario")
+        ax.set_ylim(0,1); ax.set_xlabel("Year"); ax.set_ylabel("Share ≥ threshold"); ax.grid(True); ax.legend()
+        st.pyplot(fig)
+
+# ===== Tab 5: What-If & Digital Twin =====
+with tabs[4]:
+    st.subheader("Simulation Results (Adjust in Sidebar)")
+    c = st.columns(2)
+    with c[0]:
+        st.write("**Mid Gap**")
+        fig, ax = plt.subplots()
+        ax.plot(tbl_scn["year"], tbl_scn["mid_gap"], marker="o")
+        ax.set_xlabel("Year"); ax.set_ylabel("Gap"); ax.grid(True)
+        st.pyplot(fig)
+    with c[1]:
+        st.write("**Senior Gap**")
+        fig, ax = plt.subplots()
+        ax.plot(tbl_scn["year"], tbl_scn["senior_gap"], marker="o")
+        ax.set_xlabel("Year"); ax.set_ylabel("Gap"); ax.grid(True)
+        st.pyplot(fig)
+
+    st.caption("Tip: Use the sidebar to test early retirements, diversity boosts, upskilling, or hiring changes.")
+
+# ===== Tab 6: Retention Risk Forecast =====
+with tabs[5]:
+    st.subheader("Mid-Level Attrition Probability Over Time")
     fig, ax = plt.subplots()
-    ax.plot(tbl_A["year"], tbl_A["diversity_mid_share"], marker="o", label="Baseline")
-    ax.plot(tbl_S["year"], tbl_S["diversity_mid_share"], marker="o", label="Scenario")
-    ax.set_title("Diversity (Mid) Over Time")
-    ax.set_xlabel("Year"); ax.set_ylabel("URG Share (0-1)")
-    ax.set_ylim(0,1); ax.grid(True); ax.legend()
-    st.pyplot(fig)
-with c[1]:
-    st.write("**Senior-Level Gap: Baseline vs Scenario**")
-    fig, ax = plt.subplots()
-    ax.plot(tbl_A["year"], tbl_A["senior_gap"], marker="o", label="Baseline")
-    ax.plot(tbl_S["year"], tbl_S["senior_gap"], marker="o", label="Scenario")
-    ax.set_title("Senior Gap Over Time")
-    ax.set_xlabel("Year"); ax.set_ylabel("Gap")
+    ax.plot(tbl_baseline["year"], tbl_baseline["avg_attrition_prob_mid"], marker="o", label="Baseline")
+    ax.plot(tbl_scn["year"], tbl_scn["avg_attrition_prob_mid"], marker="o", label="Scenario")
+    ax.set_ylim(0,0.6); ax.set_xlabel("Year"); ax.set_ylabel("Probability")
     ax.grid(True); ax.legend()
     st.pyplot(fig)
 
-# ------------------------------
-# RETENTION RISKS (Feature 9)
-# ------------------------------
-st.header("🚨 Forecasting Retention Risks (Mid-Level)")
-fig, ax = plt.subplots()
-ax.plot(tbl_A["year"], tbl_A["avg_attrition_prob_mid"], marker="o", label="Baseline")
-ax.plot(tbl_S["year"], tbl_S["avg_attrition_prob_mid"], marker="o", label="Scenario")
-ax.set_title("Avg Attrition Probability — Mid Leaders")
-ax.set_xlabel("Year"); ax.set_ylabel("Probability"); ax.set_ylim(0, 0.6)
-ax.grid(True); ax.legend()
-st.pyplot(fig)
-
-# ------------------------------
-# MODEL + PREDICTION (Features 2 & 3)
-# ------------------------------
-st.header("🤖 Model Trained & Predicting Attrition")
-if attrition_model is not None:
-    # attempt prediction on a small sample
-    sample = df.sample(min(200, len(df)), random_state=7).copy()
-    try:
-        p = infer_attrition_prob(sample)
-        sample["attrition_prob"] = p
-        st.write("Sample of predicted attrition risks:")
-        st.dataframe(sample[[COL_ID, COL_ROLE, "role_level", COL_PERF, COL_TENURE, "attrition_prob"]].head(20))
+# ===== Tab 7: Diversity & DEI =====
+with tabs[6]:
+    st.subheader("Diversity in Leadership")
+    c = st.columns(2)
+    with c[0]:
+        st.write("**Mid-Level Diversity Share**")
         fig, ax = plt.subplots()
-        ax.hist(sample["attrition_prob"], bins=20)
-        ax.set_title("Distribution of Predicted Attrition Probabilities")
-        ax.set_xlabel("Probability"); ax.set_ylabel("Count")
+        ax.plot(tbl_baseline["year"], tbl_baseline["diversity_mid_share"], marker="o", label="Baseline")
+        ax.plot(tbl_scn["year"], tbl_scn["diversity_mid_share"], marker="o", label="Scenario")
+        ax.set_ylim(0,1); ax.set_xlabel("Year"); ax.set_ylabel("URG Share")
+        ax.grid(True); ax.legend()
         st.pyplot(fig)
-    except Exception as e:
-        st.warning(f"Could not compute predictions from the loaded model; using heuristic fallback. Details: {e}")
-else:
-    st.info("No model file found; the simulation uses heuristic attrition probabilities.")
+    with c[1]:
+        st.write("**Senior-Level Diversity Share**")
+        fig, ax = plt.subplots()
+        ax.plot(tbl_baseline["year"], tbl_baseline["diversity_senior_share"], marker="o", label="Baseline")
+        ax.plot(tbl_scn["year"], tbl_scn["diversity_senior_share"], marker="o", label="Scenario")
+        ax.set_ylim(0,1); ax.set_xlabel("Year"); ax.set_ylabel("URG Share")
+        ax.grid(True); ax.legend()
+        st.pyplot(fig)
 
-# ------------------------------
-# STATIC vs DIGITAL-TWIN (Model Comparison)
-# ------------------------------
-st.header("⚖️ Model Comparison — Static Succession vs Digital Twin")
-st.write("**Static succession** assumes 'ready-now' counts stay valid over time; **Digital Twin** simulates flows (attrition, retirement, promotions, hiring, upskilling).")
+# ===== Tab 8: Static vs Digital Twin =====
+with tabs[7]:
+    st.subheader("Static Succession (No Dynamics)")
+    st.dataframe(static_tbl, use_container_width=True)
+    st.subheader("Digital Twin — Your Scenario")
+    st.dataframe(tbl_scn, use_container_width=True)
 
-st.subheader("Static Snapshot (No Dynamics)")
-st.dataframe(static_tbl)
+# ===== Tab 9: Research Conclusion =====
+with tabs[8]:
+    st.subheader("Research Question")
+    st.markdown("**Can digital twin simulations more accurately predict mid-level leadership gaps in the tech industry compared to traditional succession planning?**")
 
-st.subheader("Digital Twin — Your Scenario (Per Year)")
-st.dataframe(tbl_S)
+    def quick_findings(tbl_base: pd.DataFrame, tbl_scn: pd.DataFrame) -> Dict[str,str]:
+        out = {}
+        gap_base = int(tbl_base["mid_gap"].sum())
+        gap_scn  = int(tbl_scn["mid_gap"].sum())
+        out["gap_compare"] = f"Cumulative Mid gaps — Baseline vs Scenario: {gap_base} vs {gap_scn} (lower is better)."
+        cov_base = tbl_base["mid_skill_coverage"].mean()
+        cov_scn  = tbl_scn["mid_skill_coverage"].mean()
+        out["skill"] = f"Avg Mid skill coverage — Baseline vs Scenario: {cov_base:.2f} vs {cov_scn:.2f}."
+        div_base = tbl_base["diversity_mid_share"].mean()
+        div_scn  = tbl_scn["diversity_mid_share"].mean()
+        out["div"]  = f"Avg Mid diversity share — Baseline vs Scenario: {div_base:.2f} vs {div_scn:.2f}."
+        r_base = tbl_base["avg_attrition_prob_mid"].mean()
+        r_scn  = tbl_scn["avg_attrition_prob_mid"].mean()
+        out["risk"] = f"Avg Mid attrition risk — Baseline vs Scenario: {r_base:.2f} vs {r_scn:.2f}."
+        return out
 
-# ------------------------------
-# RESEARCH QUESTION & ANSWER
-# ------------------------------
-st.header("🎯 Research Question")
-st.markdown("**Can digital twin simulations more accurately predict mid-level leadership gaps in the tech industry compared to traditional succession planning?**")
-
-# Quick inference from the tables
-def quick_findings(tbl_baseline: pd.DataFrame, tbl_scn: pd.DataFrame) -> Dict[str,str]:
-    out = {}
-    # Total mid gap across horizon
-    gap_base = int(tbl_baseline["mid_gap"].sum())
-    gap_scn  = int(tbl_scn["mid_gap"].sum())
-    out["gap_compare"] = f"Cumulative Mid-level gap (Baseline vs Scenario): {gap_base} vs {gap_scn} (lower is better)."
-    # Skill coverage avg
-    cov_base = tbl_baseline["mid_skill_coverage"].mean()
-    cov_scn  = tbl_scn["mid_skill_coverage"].mean()
-    out["skill"] = f"Avg Mid skill coverage (Baseline vs Scenario): {cov_base:.2f} vs {cov_scn:.2f}."
-    # Diversity avg
-    div_base = tbl_baseline["diversity_mid_share"].mean()
-    div_scn  = tbl_scn["diversity_mid_share"].mean()
-    out["div"]  = f"Avg Mid diversity share (Baseline vs Scenario): {div_base:.2f} vs {div_scn:.2f}."
-    # Attrition risk avg
-    r_base = tbl_baseline["avg_attrition_prob_mid"].mean()
-    r_scn  = tbl_scn["avg_attrition_prob_mid"].mean()
-    out["risk"] = f"Avg Mid attrition risk (Baseline vs Scenario): {r_base:.2f} vs {r_scn:.2f}."
-    return out
-
-kf = quick_findings(tbl_A, tbl_S)
-st.subheader("Answer (Evidence-Based):")
-st.markdown(
-    f"""
-- **Mid-level gaps**: {kf['gap_compare']}  
-- **Skills**: {kf['skill']}  
-- **Diversity**: {kf['div']}  
-- **Retention risk**: {kf['risk']}  
+    kf = quick_findings(tbl_baseline, tbl_scn)
+    st.markdown(
+        f"""
+- **Leadership Gaps:** {kf['gap_compare']}  
+- **Skills:** {kf['skill']}  
+- **DEI:** {kf['div']}  
+- **Retention Risk:** {kf['risk']}  
 """
-)
-st.success(
-    "Conclusion: **Yes**. The digital twin provides a more accurate and actionable forecast of mid-level leadership gaps than static succession planning, because it models attrition, retirement, promotions, external hiring, and upskilling over time — and lets you test what-if policies."
-)
-
-st.caption("Tip: Adjust the sidebar levers to see how interventions (diversity boosts, upskilling, external hires) change the outcomes.")
+    )
+    st.success(
+        "Conclusion: **Yes.** The digital twin predicts mid-level leadership gaps more accurately than static succession planning by modeling attrition, retirement, promotions, external hiring, and upskilling over time — and by enabling what-if testing of policies."
+    )
